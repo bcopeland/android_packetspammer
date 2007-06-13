@@ -1,4 +1,4 @@
-Packetspammer 0.5
+Packetspammer
 Andy Green <andy@warmcat.com>
 
 Packetspammer sends unencrypted broadcast packets down a mac80211 wireless
@@ -20,7 +20,7 @@ RX: Rate: 54.0Mbps, Freq: 2.417GHz, Ant: 0, Flags: 10
 
 Typical usage:
 
-  echo -n mon0 > /sys/class/ieee80211/wiphy0/add_iface
+  echo -n mon0 > /sys/class/ieee80211/phy0/add_iface
   iwconfig mon0 mode monitor
   ifconfig mon0 up
   packetspammer mon0

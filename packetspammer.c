@@ -18,83 +18,10 @@
 // Thanks for contributions:
 // 2007-03-15 fixes to getopt_long code by Matteo Croce rootkit85@yahoo.it
 
+#include "packetspammer.h"
+#include "radiotap.h"
 
-#include <stdio.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <resolv.h>
-#include <string.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <utime.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <time.h>
-#include <stdarg.h>
-#include <signal.h>
-#include <stdlib.h>
-#include <dirent.h>
-#include <sched.h>
-#include <linux/if.h>
-#include <linux/if_ether.h>
-#include <gcrypt.h>
-#include <assert.h>
-#include <openssl/ssl.h>
-#include <openssl/evp.h>
-#include <openssl/err.h>
-#include <sys/mman.h>
-#include <sys/wait.h>
-#include <netdb.h>
-#include <string.h>
-#include <getopt.h>
-#include <syslog.h>
-
-#include <net/ethernet.h>
-#include <netpacket/packet.h>
-#include <sys/wait.h>
-
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <stdio.h>
-#ifdef USE_LIBFEC_CPUDETECT
-#include <ifaddrs.h>
-#endif
-#include <string.h>
-#include <getopt.h>
-#include <syslog.h>
-#include <sys/ioctl.h>
-#include <pcap.h>
-
-#define	__user
-#include "wireless.20.h"
-#include <endian.h>
-
-typedef unsigned int u32;
-typedef unsigned short u16;
-typedef unsigned char u8;
-typedef u32 __le32;
-
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-#define	le16_to_cpu(x) (x)
-#define	le32_to_cpu(x) (x)
-#else
-#define	le16_to_cpu(x) ((((x)&0xff)<<8)|(((x)&0xff00)>>8))
-#define	le32_to_cpu(x) \
-((((x)&0xff)<<24)|(((x)&0xff00)<<8)|(((x)&0xff0000)>>8)|(((x)&0xff000000)>>24))
-#endif
-#define	unlikely(x) (x)
-
-#include "ieee80211_radiotap.h"
-
-
-#define	MAX_PENUMBRA_INTERFACES 8
+/* wifi bitrate to use in 500kHz units */
 
 static const u8 u8aRatesToUse[] = {
 
@@ -111,13 +38,15 @@ static const u8 u8aRatesToUse[] = {
 	1*2
 };
 
+/* this is the template radiotap header we send packets out with */
+
 static const u8 u8aRadiotapHeader[] = {
 
 	0x00, 0x00, // <-- radiotap version
 	0x19, 0x00, // <- radiotap header length
 	0x6f, 0x08, 0x00, 0x00, // <-- bitmap
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // <-- timestamp
-	0x00, // <-- flags
+	0x00, // <-- flags (Offset +0x10)
 	0x6c, // <-- rate (0ffset +0x11)
 	0x71, 0x09, 0xc0, 0x00, // <-- channel
 	0xde, // <-- antsignal
@@ -125,7 +54,10 @@ static const u8 u8aRadiotapHeader[] = {
 	0x01, // <-- antenna
 
 };
+#define	OFFSET_FLAGS 0x10
 #define	OFFSET_RATE 0x11
+
+/* Penumbra IEEE80211 header */
 
 static const u8 u8aIeeeHeader[] = {
 	0x08, 0x01, 0x00, 0x00,
@@ -148,13 +80,7 @@ typedef struct  {
 
 
 
-int flagHelp = 0;
-
-static const struct option optiona[] = {
-	{ "delay", required_argument, NULL, 'd' },
-	{ "help", no_argument, &flagHelp, 1 },
-	{ 0, 0, 0, 0 }
-};
+int flagHelp = 0, flagMarkWithFCS = 0;
 
 void
 Dump(u8 * pu8, int nLength)
@@ -217,8 +143,10 @@ usage(void)
 	    "\n"
 	    "Usage: packetspammer [options] <interface>\n\nOptions\n"
 	    "-d/--delay <delay> Delay between packets\n\n"
+	    "-f/--fcs           Mark as having FCS (CRC) already\n"
+	    "                   (pkt ends with 4 x sacrificial - chars)\n"
 	    "Example:\n"
-	    "  echo -n mon0 > /sys/class/ieee80211/wiphy0/add_iface\n"
+	    "  echo -n mon0 > /sys/class/ieee80211/phy0/add_iface\n"
 	    "  iwconfig mon0 mode monitor\n"
 	    "  ifconfig mon0 up\n"
 	    "  packetspammer mon0        Spam down mon0 with\n"
@@ -227,248 +155,6 @@ usage(void)
 	exit(1);
 }
 
-
-/*
- * Radiotap header iteration
- *   implemented in net/wireless/radiotap.c
- *
- * call __ieee80211_radiotap_iterator_init() to init a semi-opaque iterator
- * struct ieee80211_radiotap_iterator (no need to init the struct beforehand)
- * then loop calling __ieee80211_radiotap_iterator_next()... it returns -1
- * if there are no more args in the header, or the next argument type index
- * that is present.  The iterator's this_arg member points to the start of the
- * argument associated with the current argument index that is present,
- * which can be found in the iterator's this_arg_index member.  This arg
- * index corresponds to the IEEE80211_RADIOTAP_... defines.
- */
-/**
- * struct ieee80211_radiotap_iterator - tracks walk thru present radiotap args
- * @rtheader: pointer to the radiotap header we are walking through
- * @max_length: length of radiotap header in cpu byte ordering
- * @this_arg_index: IEEE80211_RADIOTAP_... index of current arg
- * @this_arg: pointer to current radiotap arg
- * @arg_index: internal next argument index
- * @arg: internal next argument pointer
- * @next_bitmap: internal pointer to next present u32
- * @bitmap_shifter: internal shifter for curr u32 bitmap, b0 set == arg present
- */
-
-struct ieee80211_radiotap_iterator {
-	struct ieee80211_radiotap_header *rtheader;
-	int max_length;
-	int this_arg_index;
-	u8 * this_arg;
-
-	int arg_index;
-	u8 * arg;
-	__le32 *next_bitmap;
-	u32 bitmap_shifter;
-};
-
-
-int ieee80211_radiotap_iterator_init(
-	struct ieee80211_radiotap_iterator * iterator,
-	struct ieee80211_radiotap_header * radiotap_header,
-	int max_length)
-{
-
-	/* Linux only supports version 0 radiotap format */
-
-	if (radiotap_header->it_version)
-		return (-EINVAL);
-
-	/* sanity check for allowed length and radiotap length field */
-
-	if (max_length < (le16_to_cpu(radiotap_header->it_len)))
-		return (-EINVAL);
-
-	iterator->rtheader = radiotap_header;
-	iterator->max_length = le16_to_cpu(radiotap_header->it_len);
-	iterator->arg_index = 0;
-	iterator->bitmap_shifter = le32_to_cpu(radiotap_header->it_present);
-	iterator->arg = ((u8 *)radiotap_header) +
-			sizeof (struct ieee80211_radiotap_header);
-	iterator->this_arg = 0;
-
-	/* find payload start allowing for extended bitmap(s) */
-
-	if (unlikely(iterator->bitmap_shifter &
-	    IEEE80211_RADIOTAP_PRESENT_EXTEND_MASK)) {
-		while (le32_to_cpu(*((u32 *)iterator->arg)) &
-		    IEEE80211_RADIOTAP_PRESENT_EXTEND_MASK) {
-			iterator->arg += sizeof (u32);
-
-			/*
-			 * check for insanity where the present bitmaps
-			 * keep claiming to extend up to or even beyond the
-			 * stated radiotap header length
-			 */
-
-			if ((((int)iterator->arg) - ((int)iterator->rtheader)) >
-			    iterator->max_length)
-				return (-EINVAL);
-
-		}
-
-		iterator->arg += sizeof (u32);
-
-		/*
-		 * no need to check again for blowing past stated radiotap
-		 * header length, becuase ieee80211_radiotap_iterator_next
-		 * checks it before it is dereferenced
-		 */
-
-	}
-
-	/* we are all initialized happily */
-
-	return (0);
-}
-
-
-/**
- * ieee80211_radiotap_iterator_next - return next radiotap parser iterator arg
- * @iterator: radiotap_iterator to move to next arg (if any)
- *
- * Returns: next present arg index on success or negative if no more or error
- *
- * This function returns the next radiotap arg index (IEEE80211_RADIOTAP_...)
- * and sets iterator->this_arg to point to the payload for the arg.  It takes
- * care of alignment handling and extended present fields.  interator->this_arg
- * can be changed by the caller.  The args pointed to are in little-endian
- * format.
- */
-
-int ieee80211_radiotap_iterator_next(
-	struct ieee80211_radiotap_iterator * iterator)
-{
-
-	/*
-	 * small length lookup table for all radiotap types we heard of
-	 * starting from b0 in the bitmap, so we can walk the payload
-	 * area of the radiotap header
-	 *
-	 * There is a requirement to pad args, so that args
-	 * of a given length must begin at a boundary of that length
-	 * -- but note that compound args are allowed (eg, 2 x u16
-	 * for IEEE80211_RADIOTAP_CHANNEL) so total arg length is not
-	 * a reliable indicator of alignment requirement.
-	 *
-	 * upper nybble: content alignment for arg
-	 * lower nybble: content length for arg
-	 */
-
-	static const u8 rt_sizes[] = {
-		[IEEE80211_RADIOTAP_TSFT] = 0x88,
-		[IEEE80211_RADIOTAP_FLAGS] = 0x11,
-		[IEEE80211_RADIOTAP_RATE] = 0x11,
-		[IEEE80211_RADIOTAP_CHANNEL] = 0x24,
-		[IEEE80211_RADIOTAP_FHSS] = 0x22,
-		[IEEE80211_RADIOTAP_DBM_ANTSIGNAL] = 0x11,
-		[IEEE80211_RADIOTAP_DBM_ANTNOISE] = 0x11,
-		[IEEE80211_RADIOTAP_LOCK_QUALITY] = 0x22,
-		[IEEE80211_RADIOTAP_TX_ATTENUATION] = 0x22,
-		[IEEE80211_RADIOTAP_DB_TX_ATTENUATION] = 0x22,
-		[IEEE80211_RADIOTAP_DBM_TX_POWER] = 0x11,
-		[IEEE80211_RADIOTAP_ANTENNA] = 0x11,
-		[IEEE80211_RADIOTAP_DB_ANTSIGNAL] = 0x11,
-		[IEEE80211_RADIOTAP_DB_ANTNOISE] = 0x11
-		/*
-		 * add more here as they are defined in
-		 * include/net/ieee80211_radiotap.h
-		 */
-	};
-
-	/*
-	 * for every radiotap entry we can at
-	 * least skip (by knowing the length)...
-	 */
-
-	while (iterator->arg_index < sizeof (rt_sizes)) {
-		int hit = 0;
-
-		if (!(iterator->bitmap_shifter & 1))
-			goto next_entry; /* arg not present */
-
-		/*
-		 * arg is present, account for alignment padding
-		 *  8-bit args can be at any alignment
-		 * 16-bit args must start on 16-bit boundary
-		 * 32-bit args must start on 32-bit boundary
-		 * 64-bit args must start on 64-bit boundary
-		 *
-		 * note that total arg size can differ from alignment of
-		 * elements inside arg, so we use upper nybble of length
-		 * table to base alignment on
-		 *
-		 * also note: these alignments are ** relative to the
-		 * start of the radiotap header **.  There is no guarantee
-		 * that the radiotap header itself is aligned on any
-		 * kind of boundary.
-		 */
-
-		if ((((int)iterator->arg)-((int)iterator->rtheader)) &
-		    ((rt_sizes[iterator->arg_index] >> 4) - 1))
-			iterator->arg_index +=
-				(rt_sizes[iterator->arg_index] >> 4) -
-				((((int)iterator->arg) -
-				((int)iterator->rtheader)) &
-				((rt_sizes[iterator->arg_index] >> 4) - 1));
-
-		/*
-		 * this is what we will return to user, but we need to
-		 * move on first so next call has something fresh to test
-		 */
-
-		iterator->this_arg_index = iterator->arg_index;
-		iterator->this_arg = iterator->arg;
-		hit = 1;
-
-		/* internally move on the size of this arg */
-
-		iterator->arg += rt_sizes[iterator->arg_index] & 0x0f;
-
-		/*
-		 * check for insanity where we are given a bitmap that
-		 * claims to have more arg content than the length of the
-		 * radiotap section.  We will normally end up equalling this
-		 * max_length on the last arg, never exceeding it.
-		 */
-
-		if ((((int)iterator->arg) - ((int)iterator->rtheader)) >
-		    iterator->max_length)
-			return (-EINVAL);
-
-	next_entry:
-
-		iterator->arg_index++;
-		if (unlikely((iterator->arg_index & 31) == 0)) {
-			/* completed current u32 bitmap */
-			if (iterator->bitmap_shifter & 1) {
-				/* b31 was set, there is more */
-				/* move to next u32 bitmap */
-				iterator->bitmap_shifter = le32_to_cpu(
-					*iterator->next_bitmap);
-				iterator->next_bitmap++;
-			} else {
-				/* no more bitmaps: end */
-				iterator->arg_index = sizeof (rt_sizes);
-			}
-		} else { /* just try the next bit */
-			iterator->bitmap_shifter >>= 1;
-		}
-
-		/* if we found a valid arg earlier, return it now */
-
-		if (hit)
-			return (iterator->this_arg_index);
-
-	}
-
-	/* we don't know how to handle any more args, we're done */
-
-	return (-1);
-}
 
 int
 main(int argc, char *argv[])
@@ -494,7 +180,13 @@ main(int argc, char *argv[])
 
 	while (1) {
 		int nOptionIndex;
-		int c = getopt_long(argc, argv, "rmd:hl",
+		static const struct option optiona[] = {
+			{ "delay", required_argument, NULL, 'd' },
+			{ "fcs", no_argument, &flagMarkWithFCS, 1 },
+			{ "help", no_argument, &flagHelp, 1 },
+			{ 0, 0, 0, 0 }
+		};
+		int c = getopt_long(argc, argv, "d:hf",
 			optiona, &nOptionIndex);
 
 		if (c == -1)
@@ -508,6 +200,10 @@ main(int argc, char *argv[])
 
 		case 'd': // delay
 			nDelay = atoi(optarg);
+			break;
+
+		case 'f': // mark as FCS attached
+			flagMarkWithFCS = 1;
 			break;
 
 		default:
@@ -658,6 +354,8 @@ main(int argc, char *argv[])
 
 		memcpy(u8aSendBuffer, u8aRadiotapHeader,
 			sizeof (u8aRadiotapHeader));
+		if (flagMarkWithFCS)
+			pu8[OFFSET_FLAGS] |= IEEE80211_RADIOTAP_F_FCS;
 		pu8[OFFSET_RATE] = u8aRatesToUse[nRateIndex++];
 		if (nRateIndex >= sizeof (u8aRatesToUse))
 			nRateIndex = 0;
@@ -669,7 +367,7 @@ main(int argc, char *argv[])
 		pu8 += sprintf((char *)pu8,
 		    "Packetspammer --"
 		    "broadcast packet"
-		    "#%05d -- :-D --%s",
+		    "#%05d -- :-D --%s ----",
 		    nOrdinal++, szHostname);
 		r = pcap_inject(ppcap, u8aSendBuffer, pu8 - u8aSendBuffer);
 		if (r != (pu8-u8aSendBuffer)) {
