@@ -278,6 +278,7 @@ main(int argc, char *argv[])
 		struct ieee80211_radiotap_iterator rti;
 		PENUMBRA_RADIOTAP_DATA prd;
 		u8 * pu8Payload = u8aSendBuffer;
+		int n, nRate;
 
 		// receive
 
@@ -294,6 +295,9 @@ main(int argc, char *argv[])
 
 		u16HeaderLen = (pu8Payload[2] + (pu8Payload[3] << 8));
 
+		printf("rtap: ");
+		Dump(pu8Payload, u16HeaderLen);
+
 		if (ppcapPacketHeader->len <
 		    (u16HeaderLen + n80211HeaderLength))
 			continue;
@@ -308,7 +312,7 @@ main(int argc, char *argv[])
 		    bytes) < 0)
 			continue;
 
-		while (ieee80211_radiotap_iterator_next(&rti) > 0) {
+		while ((n = ieee80211_radiotap_iterator_next(&rti)) == 0) {
 
 			switch (rti.this_arg_index) {
 			case IEEE80211_RADIOTAP_RATE:
@@ -356,7 +360,7 @@ main(int argc, char *argv[])
 			sizeof (u8aRadiotapHeader));
 		if (flagMarkWithFCS)
 			pu8[OFFSET_FLAGS] |= IEEE80211_RADIOTAP_F_FCS;
-		pu8[OFFSET_RATE] = u8aRatesToUse[nRateIndex++];
+		nRate = pu8[OFFSET_RATE] = u8aRatesToUse[nRateIndex++];
 		if (nRateIndex >= sizeof (u8aRatesToUse))
 			nRateIndex = 0;
 		pu8 += sizeof (u8aRadiotapHeader);
@@ -365,10 +369,10 @@ main(int argc, char *argv[])
 		pu8 += sizeof (u8aIeeeHeader);
 
 		pu8 += sprintf((char *)pu8,
-		    "Packetspammer --"
+		    "Packetspammer %02d"
 		    "broadcast packet"
 		    "#%05d -- :-D --%s ----",
-		    nOrdinal++, szHostname);
+		    nRate/2, nOrdinal++, szHostname);
 		r = pcap_inject(ppcap, u8aSendBuffer, pu8 - u8aSendBuffer);
 		if (r != (pu8-u8aSendBuffer)) {
 			perror("Trouble injecting packet");
